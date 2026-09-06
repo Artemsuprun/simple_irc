@@ -1,0 +1,13 @@
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
