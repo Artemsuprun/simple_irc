@@ -128,6 +128,8 @@ class Msg:
         # If the connection is closed before the entire payload is received, recv_exact will
         # raise a ConnectionError, which will be handled by the caller.
         payload = cls.recv_exact(sock, data_len)
+        if payload is None:
+            raise ConnectionError("Connection closed before receiving the full payload.")
 
         # Decode the payload from bytes to a UTF-8 string.
         try:
