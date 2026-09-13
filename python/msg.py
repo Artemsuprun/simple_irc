@@ -96,13 +96,30 @@ class Msg:
 
         return header + encoded
 
+    # Made this class method to reduce code duplication in MsgReader and Msg.recv
+    @classmethod
+    def _from_parts(cls, cmd, data_len, payload):
+        """Create a Msg instance from its components without re-validating."""
+        if cmd not in COMMANDS:
+            raise ProtocolError(f"Unknown command: {cmd}")
+        if data_len > MAX_DATA:
+            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
+
+        # Decode the payload from bytes to a UTF-8 string.
+        try:
+            data = bytes(payload).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError("Payload is not valid UTF-8") from exc
+
+        return cls(cmd, data)
+
     @classmethod
     def recv(cls, sock):
         """Receive and deserialize exactly one message from a socket."""
 
         # TCP does not guarantee that a single recv call will return the entire message, 
         # so we must read the header first to know how many bytes to expect for the payload. 
-        header = cls.recv_exact(sock, HEADER_SIZE)
+        header = cls._recv_exact(sock, HEADER_SIZE)
 
         # Clean break from the socket (e.g., client disconnected) is represented by None.
         if header is None:
@@ -114,35 +131,21 @@ class Msg:
         except struct.error as exc:
             raise ProtocolError("Invalid message header") from exc
 
-        # Validate the command
-        if cmd not in COMMANDS:
-            raise ProtocolError(f"Unknown command: {cmd}")
-
-        # Validate the payload length
-        if data_len > MAX_DATA:
-            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
         if data_len == 0:
-            return cls(cmd, "")
+            return cls._from_parts(cmd, data_len, b"")
 
         # This will block until the entire payload is received or the connection is closed.
-        # If the connection is closed before the entire payload is received, recv_exact will
+        # If the connection is closed before the entire payload is received, _recv_exact will
         # raise a ConnectionError, which will be handled by the caller.
-        payload = cls.recv_exact(sock, data_len)
+        payload = cls._recv_exact(sock, data_len)
         if payload is None:
             raise ConnectionError("Connection closed before receiving the full payload.")
 
-        # Decode the payload from bytes to a UTF-8 string.
-        try:
-            data = payload.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError("Payload is not valid UTF-8") from exc
-
-        return cls(cmd, data)
-
+        return cls._from_parts(cmd, data_len, payload)
 
     # Socket helpers
     @staticmethod
-    def recv_exact(sock, size):
+    def _recv_exact(sock, size):
         """Receive exactly 'size' bytes."""
 
         # The First call to recv() lets us know if the connection is closed. 
@@ -167,3 +170,75 @@ class Msg:
 
         # convert mutable bytearray to immutable bytes before returning
         return bytes(data)
+
+
+# Non-blocking message assembly
+class MsgReader:
+    """Assemble messages from a stream of bytes in a non-blocking manner."""
+
+    def __init__(self):
+        """Initialize an empty buffer for incoming bytes."""
+        self._buf = bytearray()
+
+    def feed(self, data):
+        """Append newly-received raw bytes to the internal buffer."""
+        self._buf.extend(data)
+
+    def __iter__(self):
+        """Return self to allow iteration over complete messages."""
+        return self
+
+    def __next__(self):
+        """Return the next complete message from the buffer, or raise StopIteration if none are available."""
+        if len(self._buf) < HEADER_SIZE:
+            raise StopIteration
+
+        cmd, data_len = struct.unpack(HEADER, self._buf[:HEADER_SIZE])
+
+        # Validate before we decide how many more bytes to wait for, so a
+        # corrupt/malicious header can't make us buffer forever.
+        if cmd not in COMMANDS:
+            raise ProtocolError(f"Unknown command: {cmd}")
+        if data_len > MAX_DATA:
+            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
+
+        total_size = HEADER_SIZE + data_len
+        if len(self._buf) < total_size:
+            raise StopIteration  # full payload hasn't arrived yet
+
+        payload = bytes(self._buf[HEADER_SIZE:total_size])
+        del self._buf[:total_size]  # consume this message, keep any leftover bytes
+
+        return Msg._from_parts(cmd, data_len, payload)
+
+
+# Non-blocking message sending for the client
+class MsgWriter:
+    """Buffer and send messages in a non-blocking manner."""
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def queue(self, msg):
+        """Append a Msg's wire bytes to the outgoing buffer."""
+        self._buf.extend(msg.pack())
+
+    @property
+    def pending(self):
+        """True if there are still unsent bytes buffered."""
+        return len(self._buf) > 0
+
+    def send(self, sock):
+        """Attempt to send as many bytes as possible from the buffer to the socket."""
+        if not self._buf:
+            return True
+
+        try:
+            sent = sock.send(self._buf)
+        except BlockingIOError:
+            # Kernel send buffer is full right now; nothing went out.
+            # Wait for the next write-ready notification and try again.
+            return False
+
+        del self._buf[:sent]  # drop only what actually made it out
+        return len(self._buf) == 0
