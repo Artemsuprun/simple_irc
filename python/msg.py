@@ -14,6 +14,7 @@ Packet format:
 All integers use network byte order (big endian).
 """
 
+import json
 import struct
 
 
@@ -28,21 +29,59 @@ MAX_DATA = MAX_SIZE - HEADER_SIZE
 if MAX_SIZE <= HEADER_SIZE:
     raise ValueError(f"MAX_SIZE must be greater than {HEADER_SIZE} bytes to accommodate the header.")
 
-# Commands
-CREATE = 10
-ROOMS = 20
-JOIN = 30
-LEAVE = 40
-MEMBERS = 50
-MESSAGE = 60
+# Commands:
+# Client -> Server
+# Room operations
+CREATE_ROOM = 10
+LIST_ROOMS = 11
+JOIN_ROOM = 12
+LEAVE_ROOM = 13
+LIST_MEMBERS = 14
+GET_ROOM_INFO = 15
+GET_HISTORY = 16
 
+# User operations
+SET_USERNAME = 30
+GET_SELF = 31
+PING = 32
+QUIT = 34
+
+# Messaging
+SEND_MESSAGE = 50
+
+# Server -> Client
+# Responses
+PONG = 33
+OK = 100
+ERROR = 101
+ROOM_MESSAGE = 200
+ROOM_HISTORY = 201
+USER_JOINED = 202
+USER_LEFT = 203
+USER_DISCONNECTED = 204
+
+# quick access commands
 COMMANDS = {
-    CREATE,
-    ROOMS,
-    JOIN,
-    LEAVE,
-    MEMBERS,
-    MESSAGE,
+    CREATE_ROOM,
+    LIST_ROOMS,
+    JOIN_ROOM,
+    LEAVE_ROOM,
+    LIST_MEMBERS,
+    GET_ROOM_INFO,
+    GET_HISTORY,
+    SET_USERNAME,
+    GET_SELF,
+    PING,
+    QUIT,
+    SEND_MESSAGE,
+    PONG,
+    OK,
+    ERROR,
+    ROOM_MESSAGE,
+    ROOM_HISTORY,
+    USER_JOINED,
+    USER_LEFT,
+    USER_DISCONNECTED,
 }
 
 
@@ -56,29 +95,75 @@ class ProtocolError(Exception):
 class Msg:
     """Represents a single message exchanged between the client and server."""
 
-    def __init__(self, cmd, data=""):
+    def __init__(self, cmd, data=None):
         """Initialize a message with a command and optional payload."""
         self.set_msg(cmd, data)
 
-    @property
-    def data_len(self):
-        """Return the payload size in bytes."""
+    @staticmethod
+    def _encode_data(data):
+        """Encode the JSON payload into UTF-8 bytes."""
 
-        # len(self.data) returns the number of characters in the string, 
-        # but we need the number of bytes when encoded in UTF-8.
-        return len(self.data.encode("utf-8"))
+        try:
+            encoded = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("Payload is not JSON serializable") from exc
 
-    def set_msg(self, cmd, data=""):
-        """Set and validate the command and payload."""
+        if len(encoded) > MAX_DATA:
+            raise ProtocolError(f"Message is too large. Max payload is {MAX_DATA} bytes.")
 
-        # Reject unknown commands
+        return encoded
+
+    @staticmethod
+    def _decode_data(payload):
+        """Decode UTF-8 bytes into a JSON payload."""
+
+        # Decode the bytes to a UTF-8 text payload.
+        try:
+            text = bytes(payload).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError("Payload is not valid UTF-8") from exc
+        # Decode the text to json payload
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError("Payload is not valid JSON") from exc
+
+        return data
+
+    @staticmethod
+    def _validate_command(cmd):
+        """Validate command to ensure it's recognized by the protocol."""
+
         if cmd not in COMMANDS:
             raise ProtocolError(f"Unknown command: {cmd}")
 
-        # encode the data to check its byte length
-        encoded = data.encode("utf-8")
-        if len(encoded) > MAX_DATA: 
-            raise ProtocolError(f"Message is too large. Maximum payload is {MAX_DATA} bytes.")
+    @classmethod
+    def _validate_header(cls, cmd, data_len):
+        """Validate command and payload length from a message header."""
+
+        # validate cmd
+        cls._validate_command(cmd)
+        # validate max payload size
+        if data_len > MAX_DATA:
+            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
+
+    @property
+    def data_len(self):
+        """Return the JSON payload in bytes."""
+
+        return len(self._encode_data(self.data))
+
+    def set_msg(self, cmd, data=None):
+        """Set and validate the command and payload."""
+
+        # Reject unknown commands
+        self._validate_command(cmd)
+        # set an empty json input
+        if data is None:
+            data = {}
+
+        # Validate the payload can be serialized and fits.
+        _ = self._encode_data(data)
 
         self.cmd = cmd
         self.data = data
@@ -86,33 +171,27 @@ class Msg:
     def pack(self):
         """Serialize the message into bytes used for sending over a socket."""
 
-        # Encode the payload to bytes and check its length
-        encoded = self.data.encode("utf-8")
-        if len(encoded) > MAX_DATA:
-            raise ProtocolError(f"Message is too large. Maximum payload is {MAX_DATA} bytes.")
-
+        # Encode the json payload
+        encoded = self._encode_data(self.data)
         # Pack the header with the command and payload length, then append the encoded payload
         header = struct.pack(HEADER, self.cmd, len(encoded))
 
         return header + encoded
 
-    # Made this class method to reduce code duplication in MsgReader and Msg.recv
     @classmethod
     def _from_parts(cls, cmd, data_len, payload):
-        """Create a Msg instance from its components without re-validating."""
-        if cmd not in COMMANDS:
-            raise ProtocolError(f"Unknown command: {cmd}")
-        if data_len > MAX_DATA:
-            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
+        """Create a Msg instance from its components."""
 
-        # Decode the payload from bytes to a UTF-8 string.
-        try:
-            data = bytes(payload).decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError("Payload is not valid UTF-8") from exc
+        cls._validate_header(cmd, data_len)
+        if len(payload) != data_len:
+            raise ProtocolError(f"Payload length mismatch: header says {data_len}, got {len(payload)}")
+
+        # Decode the bytes to a UTF-8 test payload.
+        data = cls._decode_data(bytes(payload))
 
         return cls(cmd, data)
 
+    # ----------- Blocking Method (Not in use, might remove entirely later) -------------
     @classmethod
     def recv(cls, sock):
         """Receive and deserialize exactly one message from a socket."""
@@ -132,7 +211,7 @@ class Msg:
             raise ProtocolError("Invalid message header") from exc
 
         if data_len == 0:
-            return cls._from_parts(cmd, data_len, b"")
+            raise ProtocolError("JSON payload cannot be empty")
 
         # This will block until the entire payload is received or the connection is closed.
         # If the connection is closed before the entire payload is received, _recv_exact will
@@ -197,10 +276,7 @@ class MsgReader:
 
         # Validate before we decide how many more bytes to wait for, so a
         # corrupt/malicious header can't make us buffer forever.
-        if cmd not in COMMANDS:
-            raise ProtocolError(f"Unknown command: {cmd}")
-        if data_len > MAX_DATA:
-            raise ProtocolError(f"Payload exceeds maximum size: {data_len} bytes")
+        Msg._validate_header(cmd, data_len)
 
         total_size = HEADER_SIZE + data_len
         if len(self._buf) < total_size:
