@@ -122,7 +122,7 @@ class Msg:
             text = bytes(payload).decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ProtocolError("Payload is not valid UTF-8") from exc
-        # Decode the text to json payload
+        # Parse the JSON text into a Python object
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -186,7 +186,7 @@ class Msg:
         if len(payload) != data_len:
             raise ProtocolError(f"Payload length mismatch: header says {data_len}, got {len(payload)}")
 
-        # Decode the bytes to a UTF-8 test payload.
+        # Decode the bytes to a UTF-8 text payload.
         data = cls._decode_data(bytes(payload))
 
         return cls(cmd, data)
