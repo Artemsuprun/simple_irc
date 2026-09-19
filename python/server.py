@@ -9,6 +9,7 @@ Uses:
     - TCP sockets
     - selectors for event-driven I/O
     - custom binary message protocol
+    - JSON message payloads
 """
 
 import logging
@@ -27,6 +28,7 @@ PORT = 12345
 MAX_HISTORY = 10
 MAX_USERNAME_LENGTH = 32
 MAX_ROOM_NAME_LENGTH = 32
+ALLOW_CHANGE_USERNAME = False
 
 
 # Logging
@@ -115,13 +117,6 @@ class Room:
 
         return list(self.history)
 
-    def broadcast(self, cmd, data, exclude=None):
-        """Send a message to every member."""
-
-        for client in self.members:
-            if client is not exclude:
-                client.send(cmd, data)
-
     def __len__(self):
         return len(self.members)
 
@@ -149,33 +144,34 @@ class IRCServer:
         # Track connected clients and active rooms
         self.clients = {} # socket -> Client
         self.rooms = {}   # room name -> Room
+        self.users = {}   # usernames -> Client
 
     # Server lifecycle
     def start(self):
         """Start the server."""
 
-        # Create a TCP socket, bind it to the host and port, and listen for incoming connections.
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Set socket options to allow reusing the address to avoid "Address already in use" errors on restart.
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind( (self.host, self.port) )
-        # Start listening for incoming connections
-        self.server_socket.listen()
-        # Set the server socket to non-blocking mode so selector can manage it without blocking the main thread.
-        self.server_socket.setblocking(False)
-
-        # Register the server socket with the selector to handle incoming connections.
-        self.selector.register(self.server_socket, selectors.EVENT_READ, data=None)
-
-        self.running = True
-
-        logger.info("IRC server listening on %s:%s", self.host, self.port)
-
-        # Run the main event loop in a try/finally block to ensure graceful shutdown on exit.
-        # Note: We catch KeyboardInterrupt to allow the server to be stopped with Ctrl+C,
-        # and log any unexpected exceptions. final block ensures that shutdown is called to 
-        # clean up resources. Might add signal handling in the future for more graceful shutdowns.
         try:
+            # Create a TCP socket, bind it to the host and port, and listen for incoming connections.
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Set socket options to allow reusing the address to avoid "Address already in use" errors on restart.
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind( (self.host, self.port) )
+            # Start listening for incoming connections
+            self.server_socket.listen()
+            # Set the server socket to non-blocking mode so selector can manage it without blocking the main thread.
+            self.server_socket.setblocking(False)
+
+            # Register the server socket with the selector to handle incoming connections.
+            self.selector.register(self.server_socket, selectors.EVENT_READ, data=None)
+
+            self.running = True
+
+            logger.info("IRC server listening on %s:%s", self.host, self.port)
+
+            # Run the main event loop in a try/finally block to ensure graceful shutdown on exit.
+            # Note: We catch KeyboardInterrupt to allow the server to be stopped with Ctrl+C,
+            # and log any unexpected exceptions. final block ensures that shutdown is called to 
+            # clean up resources. Might add signal handling in the future for more graceful shutdowns.
             self.run()
         except KeyboardInterrupt: # Handle Ctrl+C gracefully to stop the server.
             logger.info("Server interrupted by user.")
@@ -321,6 +317,13 @@ class IRCServer:
         client.send(cmd, data)
         self.set_events(client, read=True, write=True)
 
+    def broadcast_to_room(self, room, cmd, data, exclude=None):
+        """Send a message to everyone part of a room."""
+
+        for client in room.members:
+            if client is not exclude:
+                self.queue_message(client, cmd, data)
+
     def disconnect(self, client):
         """Remove the client from the server and all rooms."""
 
@@ -330,20 +333,26 @@ class IRCServer:
 
         logger.info("Disconnecting %s", client)
 
+        # remove username from users
+        if self.users.get(client.username) is client:
+            del self.users[client.username]
+
         # Inform the room the user left
         for room_name in list(client.rooms):
             room = self.rooms.get(room_name)
             if room is None:
                 continue
 
-            room.remove_member(client)
-            room.broadcast(
+            self.broadcast_to_room(
+                room,
                 msg.USER_DISCONNECTED,
                 {
                     "username": client.username,
                     "room": room.name,
-                }
+                },
+                exclude=client
             )
+            room.remove_member(client)
 
             # if no more members, remove room.
             self.remove_empty_room(room)
@@ -450,51 +459,250 @@ class IRCServer:
 
     def handle_create_room(self, client, data):
         """Create a new room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room_name = self.require_field(data, "room")
+
+            if not isinstance(room_name, str):
+                raise ValueError("Room name must be a string")
+            if not room_name:
+                raise ValueError("Room name cannot be empty")
+            if len(room_name) > MAX_ROOM_NAME_LENGTH:
+                raise ValueError("Room name is too long")
+            if room_name in self.rooms:
+                raise ValueError("Room already exists")
+
+            self.rooms[room_name] = Room(room_name)
+
+            self.send_ok(
+                client,
+                {
+                    "room": room_name,
+                }
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_list_rooms(self, client, data):
         """Return all available rooms."""
-        pass
+
+        self.send_ok(
+            client,
+            {
+                "rooms": list(self.rooms.keys()),
+            }
+        )
 
     def handle_join_room(self, client, data):
         """Join an existing room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+            if room.has_member(client):
+                raise ValueError("Already in room")
+
+            room.add_member(client)
+            self.send_ok(
+                client,
+                {
+                    "room": room.name,
+                }
+            )
+
+            self.broadcast_to_room(
+                room,
+                msg.USER_JOINED,
+                {
+                    "username": client.username,
+                    "room": room.name,
+                },
+                exclude=client
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_leave_room(self, client, data):
         """Client leaves a room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+
+            if not room.has_member(client):
+                raise ValueError("You are not in this room")
+
+            self.broadcast_to_room(
+                room,
+                msg.USER_LEFT,
+                {
+                    "username": client.username,
+                    "room": room.name,
+                },
+                exclude=client
+            )
+
+            room.remove_member(client)
+            self.send_ok(
+                client,
+                {
+                    "room": room.name,
+                }
+            )
+
+            self.remove_empty_room(room)
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_list_members(self, client, data):
         """Return the members of a room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+
+            self.send_ok(
+                client,
+                {
+                    "room": room.name,
+                    "members": [ member.username for member in room.members ],
+                }
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_get_room_info(self, client, data):
         """Return info about the room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+
+            self.send_ok(
+                client,
+                {
+                    "room": room.name,
+                    "members": len(room.members),
+                    "history_size": len(room.history),
+                },
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_get_history(self, client, data):
         """Return room message history."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+
+            self.send_ok(
+                client,
+                {
+                    "room": room.name,
+                    "history": room.get_history(),
+                }
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_set_username(self, client, data):
         """Set a client's username."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            username = self.require_field(data, "username")
+
+            if not isinstance(username, str):
+                raise ValueError("Username must be a string")
+            if not username:
+                raise ValueError("Username cannot be empty")
+            if len(username) > MAX_USERNAME_LENGTH:
+                raise ValueError("Username is too long")
+
+            if username in self.users and self.users[username] is not client:
+                raise ValueError("Username is already taken")
+            
+            if client.username is not None:
+                if not ALLOW_CHANGE_USERNAME:
+                    raise ValueError("User already has a username")
+
+                self.users.pop(client.username, None)
+
+            # update both client and user name lookup
+            client.username = username
+            self.users[username] = client
+            
+            self.send_ok(
+                client,
+                {
+                    "username": username,
+                }
+            )
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
     def handle_get_self(self, client, data):
         """Return info about the client."""
-        pass
+
+        self.send_ok(
+            client,
+            {
+                "username": client.username,
+                "address": client.address[0],
+                "port": client.address[1],
+                "rooms": list(client.rooms),
+            }
+        )
 
     def handle_ping(self, client, data):
         """Responds to a ping."""
-        pass
+
+        self.queue_message(client, msg.PONG, {})
 
     def handle_quit(self, client, data):
         """Disconnects the client."""
-        pass
 
-    def handle_send_message(seld, client, data):
+        self.disconnect(client)
+
+    def handle_send_message(self, client, data):
         """Sends a message to a specific room."""
-        pass
+
+        try:
+            data = self.require_dict(data)
+            room = self.get_room(data)
+            text = self.require_field(data, "msg")
+
+            if not isinstance(text, str):
+                raise ValueError("Message must be a string")
+            if not text:
+                raise ValueError("Message cannot be empty")
+            if not room.has_member(client):
+                raise ValueError("You are not in this room")
+
+            msg_data = {
+                "room": room.name,
+                "username": client.username,
+                "msg": text,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self.broadcast_to_room(
+                room,
+                msg.ROOM_MESSAGE,
+                msg_data
+            )
+            room.add_history(msg_data)
+
+        except ValueError as exc:
+            self.send_error(client, str(exc))
 
 
 # Entry point
